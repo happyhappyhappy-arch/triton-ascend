@@ -31,8 +31,8 @@ namespace StridedLoadStoreRewrite {
 using namespace mlir;
 using namespace triton;
 
-// Tag stamped on tt.indirect_load ops that this sub-step emits so the pattern
-// driver does not re-enter on its own output.
+// Tag stamped on ttasc ops that this sub-step emits so the pattern driver does
+// not re-enter on its own output.
 inline constexpr const char *RewrittenByStridedLoadStoreRewriteTAG =
     "RewrittenByStridedLoadStoreRewrite";
 
@@ -63,10 +63,11 @@ public:
                                   PatternRewriter &rewriter) const override;
 };
 
-// V2: mirror of LoadConverter for tt.store -> tt.indirect_store. Same trigger
-// condition (non-permuted + static last-axis stride > 1, non-deinterleave),
-// same source-op restrictions (AddPtr / make_tensor_ptr / one-level advance),
-// same MLIR-pattern-contract handling via the Inspected/Rewritten tags.
+// V2: mirror of LoadConverter for tt.store. Prefer ttasc.stride_store when the
+// access can be represented by scalar offset + per-axis stride/numel; otherwise
+// fall back to ttasc.indirect_store. Same source-op restrictions
+// (AddPtr / make_tensor_ptr / one-level advance), same MLIR-pattern-contract
+// handling via the Inspected/Rewritten tags.
 class StoreConverter : public OpRewritePattern<triton::StoreOp> {
 public:
     explicit StoreConverter(MLIRContext *context)

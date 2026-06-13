@@ -104,10 +104,13 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 }
 
 // -----
-// V2 rank-1 miss (AddPtr store, scalar base AddPtr + dynamic stride):
-// Runtime stride may be 1 or power-of-two, so keep the structured SIMD path.
+// V2 rank-1 hit (AddPtr store, scalar base AddPtr + dynamic stride):
+// Fold the scalar base offset into stride_store's scalar offset so it keeps the
+// original memref<?xf32> base instead of a size-1 reinterpret_cast view.
 // CHECK-LABEL: func.func @addptr_dynamic_stride_store_scalar_base
+// CHECK-NOT: memref<1xf32
 // CHECK-NOT: call @triton_indirect_store
+// CHECK: call @triton_stride_store(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<32xf32>, i64, i64, i64) -> ()
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @addptr_dynamic_stride_store_scalar_base(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
                                                           %base_offset: i64,
@@ -359,9 +362,10 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 
 // -----
 // V2 hit (AddPtr Store, 1D, static non-power-of-two stride 3):
-// tt.store(tt.addptr(splat ptr, arange*3), value) -> tt.indirect_store -> call @triton_indirect_store
+// tt.store(tt.addptr(splat ptr, arange*3), value) -> tt.stride_store -> call @triton_stride_store
 // CHECK-LABEL: func.func @addptr_store_stride3_1d
-// CHECK: call @triton_indirect_store(%{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<256xi64>, tensor<256xf32>) -> ()
+// CHECK-NOT: call @triton_indirect_store
+// CHECK: call @triton_stride_store(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<256xf32>, i32, i32, i32) -> ()
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @addptr_store_stride3_1d(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
                                           %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
@@ -399,7 +403,8 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // -----
 // V2 hit (make_tensor_ptr Store, non-permuted, low-dim non-power-of-two stride 5):
 // CHECK-LABEL: func.func @mtpt_store_low_stride5
-// CHECK: call @triton_indirect_store(%{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<4x8xi64>, tensor<4x8xf32>) -> ()
+// CHECK-NOT: call @triton_indirect_store
+// CHECK: call @triton_stride_store(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<4x8xf32>, i64, i64, i64, i64, i64) -> ()
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @mtpt_store_low_stride5(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
                                          %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
@@ -565,9 +570,10 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 
 // -----
 // V1.5 hit (make_tensor_ptr Store + boundary_check, low-dim non-power-of-two stride 5):
-// Store with mask but no "other" -- 3 operand call: (src, offset, value, mask).
+// Store boundary is represented by per-dimension numel operands.
 // CHECK-LABEL: func.func @mtpt_store_boundary
-// CHECK: call @triton_indirect_store(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<8x8xi64>, tensor<8x8xf32>, tensor<8x8xi1>) -> ()
+// CHECK-NOT: call @triton_indirect_store
+// CHECK: call @triton_stride_store(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<8x8xf32>, i64, i64, i64, i64, i64) -> ()
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @mtpt_store_boundary(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
                                       %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
