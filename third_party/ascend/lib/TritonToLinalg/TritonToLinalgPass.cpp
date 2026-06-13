@@ -124,6 +124,7 @@ static bool isSIMTOp(Operation *op)
       triton::ascend::ScatterUbToOutOp,
       triton::ascend::IndirectLoadOp,
       triton::ascend::StrideLoadOp,
+      triton::ascend::StrideStoreOp,
       triton::ascend::IndirectStoreOp
       >(op);
 }
@@ -645,6 +646,7 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
 
   patterns.add<TTOpConverters::IndirectLoadConverter>(patterns.getContext());
   patterns.add<TTOpConverters::StrideLoadConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::StrideStoreConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IndirectStoreConverter>(patterns.getContext());
   patterns.add<TTOpConverters::GatherOutToUbConverter>(patterns.getContext());
   patterns.add<TTOpConverters::ScatterUbToOutConverter>(patterns.getContext());
