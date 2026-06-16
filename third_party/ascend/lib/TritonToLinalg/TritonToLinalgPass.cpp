@@ -35,7 +35,6 @@
 #include "ascend/include/TritonToLinalg/HoistBroadcast.h"
 #include "ascend/include/TritonToLinalg/UseAnalysis.h"
 #include "ascend/include/TritonToLinalg/ImplicitPermute.h"
-#include "ascend/include/TritonToLinalg/StridedLoadStoreRewrite.h"
 #include "ascend/include/TritonToLinalg/StridedAxisCoalescing.h"
 #include "ascend/include/TritonToLinalg/TileChunkCoalescing.h"
 #include "ascend/include/TritonToLinalg/MarkTensorKindPass.h"
@@ -785,8 +784,8 @@ LogicalResult TritonToLinalgPass::processStridedLoadStoreRewriteOperations(Modul
   // H-axis-split strided load/store into a 2D contiguous [BT,H] tile (H as a
   // parallel inner lane), turning the per-element strided access into a
   // contiguous one. Bails per kernel when the load->store subgraph is not
-  // lane-safe (e.g. contains tt.dot), leaving those loads to the stride dispatch
-  // below.
+  // lane-safe (e.g. contains tt.dot), leaving those loads to the normal strided
+  // DMA path below.
   StridedAxisCoalescing::rewriteStridedAxisCoalesce(moduleOp);
 
   // TileChunkCoalescing (default-on, lower priority): when the outermost
@@ -799,25 +798,10 @@ LogicalResult TritonToLinalgPass::processStridedLoadStoreRewriteOperations(Modul
   // StridedAxisCoalescing above already claimed the coalesce factor.
   TileChunkCoalescing::rewriteTileChunkCoalesce(moduleOp);
 
-  mlir::RewritePatternSet patterns(&getContext());
-  patterns.add<StridedLoadStoreRewrite::LoadConverter,
-               StridedLoadStoreRewrite::StoreConverter>(patterns.getContext());
-
-  if (failed(applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)))) {
-    LLVM_DEBUG({
-      llvm::dbgs() << "StridedLoadStoreRewrite: pattern application failed\n";
-    });
-    return failure();
-  }
-
-  // Mirror processImplicitPermuteOperations: clean up dead IR left behind by
-  // PtrAnalysis when the pattern decided not to rewrite (e.g. stride==1 case
-  // returns failure() but PtrAnalysis has already inserted helper ExtSI ops).
-  // Without this, downstream passes may trip on stale uses.
-  mlir::PassManager pm(&getContext(), moduleOp.getOperationName());
-  pm.addPass(createCSEPass());
-  pm.addPass(createCanonicalizerPass());
-  return runPipeline(pm, getOperation());
+  // Strided load/store indirect rewrites are intentionally disabled so all
+  // strided accesses, including static non-power-of-two strides, continue
+  // through the normal DMA lowering path after the coalescing attempts above.
+  return success();
 }
 
 LogicalResult TritonToLinalgPass::processLegalStrideOperations(ModuleOp moduleOp)
@@ -860,13 +844,8 @@ void TritonToLinalgPass::runOnOperation() {
     });
   existDotFlag = existDot;
 
-  // NOTE: existSIMTOp is intentionally computed AFTER
-  // processStridedLoadStoreRewriteOperations below, because that step materializes
-  // triton::ascend::IndirectLoadOp/IndirectStoreOp (which isSIMTOp() counts).
-  // Walking here (before the rewrite) would miss them and mislabel the kernel
-  // parallel_mode as "simd" instead of "mix_simd_simt"; then enable_simt would
-  // be false and the launch would not reserve localMemorySize for the SIMT
-  // templates -> VEC UB out-of-bounds (error 341) at runtime on mix-CV kernels.
+  // NOTE: existSIMTOp is intentionally computed after the early memory-shaping
+  // steps below, so later code observes any SIMT ops materialized there.
   bool existSIMTOp = false;
 
   // Execute tensor descriptor operations conversion
@@ -882,19 +861,18 @@ void TritonToLinalgPass::runOnOperation() {
     signalPassFailure();
   }
 
-  // SIMT IndirectLoad fast-path rewrite (runs after ImplicitPermute so the
-  // permuted access patterns have already been absorbed; this step only
-  // catches non-permuted last-axis stride > 1 loads).
+  // Strided coalescing runs after ImplicitPermute so permuted access patterns
+  // have already been absorbed. Strided indirect load/store rewrites are
+  // disabled; remaining strided accesses lower through DMA.
   if (failed(processStridedLoadStoreRewriteOperations(moduleOp))) {
     LLVM_DEBUG({
-      llvm::dbgs() << "Failed to process indirect-load rewrite operations\n";
+      llvm::dbgs() << "Failed to process strided load/store operations\n";
     });
     signalPassFailure();
   }
 
-  // Detect SIMT ops AFTER the indirect-load rewrite so the freshly materialized
-  // IndirectLoadOp/IndirectStoreOp are counted (drives parallel_mode ->
-  // "mix_simd_simt" -> enable_simt -> launch reserves localMemorySize).
+  // Detect SIMT ops after the strided memory-shaping step so parallel mode
+  // reflects the final Triton-level op mix.
   moduleOp.walk([&](Operation *op) {
     if (isSIMTOp(op)) {
       existSIMTOp = true;

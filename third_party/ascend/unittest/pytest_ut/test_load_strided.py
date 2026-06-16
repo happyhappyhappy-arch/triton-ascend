@@ -18,17 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 #
-# Tests for SIMT IndirectLoad fast-path (TritonToLinalg / StridedLoadStoreRewrite).
+# Tests for strided load correctness through the normal DMA lowering path.
 #
-# What each parameter row exercises against the V1 trigger condition
-# (compileOn91095 + forceSimtTemplate, last-axis stride statically > 1,
-#  non-permuted layout, rank <= 5, not stride==2-even-size):
+# What each parameter row exercises after disabling the indirect load/store
+# rewrite in TritonToLinalg:
 #
-#   * STRIDE > 2 / odd       -> V1 should rewrite tt.load -> tt.indirect_load
-#   * STRIDE == 2, even size -> DeinterleaveStatusOptimization handles (V1 yields)
-#   * STRIDE == 2, odd size  -> V1 should rewrite (deinterleave precondition fails)
-#   * Permuted layout        -> ImplicitPermute handles (V1 must not touch)
-#   * Last-axis stride == 1  -> No rewrite (normal strided memref.copy)
+#   * STRIDE > 2 / odd       -> normal strided DMA lowering
+#   * STRIDE == 2, even size -> DeinterleaveStatusOptimization may handle it
+#   * Permuted layout        -> ImplicitPermute handles it
+#   * Last-axis stride == 1  -> normal contiguous/strided memref.copy
 #
 # Verifies correctness only -- to confirm which path actually fired, dump IR
 # with MLIR_ENABLE_DUMP=1 and grep for tt.indirect_load / tt.trans.
@@ -82,15 +80,15 @@ def _ref_1d(src_cpu: torch.Tensor, stride: int, out_numel: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("dtype,in_numel,stride,ncore,xblock,xblock_sub", [
-    # ---- V1 命中: stride > 2 (deinterleave 不接) ----
+    # ---- DMA 路径: stride > 2 (deinterleave 不接) ----
     ("float32", 4096 * 16, 16, 2, 2048, 256),   # stride=16
     ("float32", 4096 * 8,   8, 2, 2048, 256),   # stride=8
     ("float32", 4096 * 4,   4, 2, 2048, 256),   # stride=4
     ("float32", 4096 * 3,   3, 2, 2048, 256),   # stride=3 (奇数 stride, block 仍 pow2)
     ("float16", 4096 * 6,   6, 2, 2048, 256),
     ("int8",    4096 * 7,   7, 2, 2048, 256),
-    # ---- Deinterleave 接管 (stride==2 + 偶数 block, V1 让路) ----
-    # 注:无法在 Triton 中构造"奇数 size + stride==2"以测试 V1 这一支,
+    # ---- Deinterleave 接管 (stride==2 + 偶数 block) ----
+    # 注:无法在 Triton 中构造"奇数 size + stride==2"以测试这一支,
     # 因为 tl.arange 要求 end-start 是 2 的幂.
     ("float32", 4096 * 2,   2, 2, 2048, 256),
     # ---- 不应改写 (stride==1) ----
@@ -168,7 +166,7 @@ def _ref_multi_d(src_flat_cpu: torch.Tensor, blocks, strides) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("dtype,blocks,strides", [
-    # ---- V1 命中: 非 permuted, 尾轴 stride 静态 > 1, 所有 block 是 2 的幂 ----
+    # ---- DMA 路径: 非 permuted, 尾轴 stride 静态 > 1, 所有 block 是 2 的幂 ----
     # 2D
     ("float32", (4, 8),          (8, 4)),                 # stride 4
     ("float32", (4, 8),          (24, 3)),                # stride 3 (奇)
@@ -222,8 +220,8 @@ def test_multi_d_gather(dtype, blocks, strides):
 # ---------------------------------------------------------------------------
 # make_block_ptr (tt.make_tensor_ptr) strided load:
 #   Build a tl.make_block_ptr with non-default strides such that the low-dim
-#   stride is `stride_n`.  When stride_n > 1 V1 should rewrite the load to
-#   tt.indirect_load; when stride_n == 1 V1 should bail.
+#   stride is `stride_n`.  The indirect load/store rewrite is disabled, so
+#   these cases should lower through DMA.
 #
 # Sanity: this test verifies value correctness only.  For "did V1 actually
 # trigger?" see the FileCheck test under

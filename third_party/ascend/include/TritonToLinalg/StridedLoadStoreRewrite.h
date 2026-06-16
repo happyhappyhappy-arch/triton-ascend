@@ -31,20 +31,21 @@ namespace StridedLoadStoreRewrite {
 using namespace mlir;
 using namespace triton;
 
-// Tag stamped on ttasc ops that this sub-step emits so the pattern driver does
-// not re-enter on its own output.
+// Tag stamped on tt.indirect_load/store ops that this sub-step emits so the
+// pattern driver does not re-enter on its own output.
 inline constexpr const char *RewrittenByStridedLoadStoreRewriteTAG =
     "RewrittenByStridedLoadStoreRewrite";
 
-// Tag stamped on tt.load ops that this sub-step has inspected but chose not
-// to rewrite (e.g. last stride == 1, permuted, deinterleave path). Prevents
-// the greedy pattern driver from re-invoking the pattern on the same op,
-// which would re-run PtrAnalysis and accumulate dead helper IR until the
+// Tag stamped on tt.load/store ops that this sub-step has inspected but chose
+// not to rewrite (e.g. last stride == 1, permuted, deinterleave path).
+// Prevents the greedy pattern driver from re-invoking the pattern on the same
+// op, which would re-run PtrAnalysis and accumulate dead helper IR until the
 // driver gives up with PassManager::run failed.
 inline constexpr const char *InspectedByStridedLoadStoreRewriteTAG =
     "InspectedByStridedLoadStoreRewrite";
 
-// V1 SIMT IndirectLoad fast-path rewrite:
+// V1 SIMT IndirectLoad fast-path rewrite (currently not registered by
+// TritonToLinalgPass; strided loads lower through the normal DMA path):
 //   Convert tt.load to tt.indirect_load when the load's effective per-axis
 //   strides have a statically-known last-axis stride > 1 with a non-permuted
 //   layout (i.e. ImplicitPermute would not / did not touch it, and it isn't
@@ -63,11 +64,8 @@ public:
                                   PatternRewriter &rewriter) const override;
 };
 
-// V2: mirror of LoadConverter for tt.store. Prefer ttasc.stride_store when the
-// access can be represented by scalar offset + per-axis stride/numel; otherwise
-// fall back to ttasc.indirect_store. Same source-op restrictions
-// (AddPtr / make_tensor_ptr / one-level advance), same MLIR-pattern-contract
-// handling via the Inspected/Rewritten tags.
+// V2: mirror of LoadConverter for tt.store -> tt.indirect_store. Currently not
+// registered by TritonToLinalgPass so strided stores also lower through DMA.
 class StoreConverter : public OpRewritePattern<triton::StoreOp> {
 public:
     explicit StoreConverter(MLIRContext *context)
