@@ -115,9 +115,9 @@ static bool shouldRouteMaskedSingleTilePow2ToIndirect(
     return upperBound && *upperBound <= blockSize;
 }
 
-// Cheaply detect tensor-level static stride > 1 before running PtrAnalysis,
-// which mutates IR. Dynamic stride stays on the structured SIMD path, and
-// scalar offset arithmetic does not affect per-element stride.
+// Cheaply detect tensor-level stride before running PtrAnalysis, which mutates
+// IR. Dynamic tensor multipliers may be non-power-of-two at runtime, so let
+// PtrAnalysis and the stride_load dispatch decide downstream.
 static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
     if (depthBudget <= 0) {
         return true;  // Give up cheaply and let PtrAnalysis decide downstream.
@@ -134,6 +134,14 @@ static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
             isStaticConstAbsGtOne(mul.getRhs())) {
             return true;
         }
+        auto lhsConst = getStaticConstInt(mul.getLhs());
+        auto rhsConst = getStaticConstInt(mul.getRhs());
+        if (lhsConst && std::abs(*lhsConst) <= 1)
+            return offsetMayContainStrideGtOne(mul.getRhs(), depthBudget - 1);
+        if (rhsConst && std::abs(*rhsConst) <= 1)
+            return offsetMayContainStrideGtOne(mul.getLhs(), depthBudget - 1);
+        if (!lhsConst || !rhsConst)
+            return true;
         return offsetMayContainStrideGtOne(mul.getLhs(), depthBudget - 1) ||
                offsetMayContainStrideGtOne(mul.getRhs(), depthBudget - 1);
     }
@@ -277,10 +285,9 @@ static bool shouldUseStrideLoad(ArrayRef<OpFoldResult> strides,
     debugStride = -1;  // -1 == dynamic.
     if (strides.empty()) return false;
 
-    // Keep the old indirect-load dispatch boundary: only tail-axis jumps were
-    // routed to SIMT indirect load.  StrideLoad is a replacement for that path,
-    // not a new catch-all for outer-dimension dynamic strides that can still be
-    // handled by the regular DMA/coalescing lowering.
+    // Debug/profiling mode: route every tail-axis jump to stride_load/store so
+    // perf can be compared against the all-DMA branch.  Stride 1 remains on the
+    // regular DMA path.
     OpFoldResult tailStride = strides.back();
     std::optional<int64_t> strideOpt =
         tailStride.dyn_cast<Attribute>()
@@ -293,7 +300,7 @@ static bool shouldUseStrideLoad(ArrayRef<OpFoldResult> strides,
 
     int64_t stride = std::abs(strideOpt.value());
     debugStride = stride;
-  return stride > 1 && (stride & (stride - 1)) != 0;
+  return stride > 1;
 }
 
 static Value getStrideLoadOtherScalar(triton::LoadOp op,
@@ -741,8 +748,8 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
     ptrState.analyzePermute();
     if (ptrState.isPermuted) return markInspectedAndReturn();
 
-    // Stride dispatch (mirrors the old indirect-load route): only tail-axis
-    // non-power-of-two or dynamic jumps are rewritten to SIMT stride_load.
+    // Debug/profiling dispatch: tail-axis jumps, including power-of-two
+    // strides, are rewritten to SIMT stride_load.
     SmallVector<OpFoldResult> strideOfrs;
     strideOfrs.reserve(ptrState.stateInfo.size());
     for (const TritonToStructured::StateInfo &info : ptrState.stateInfo)
@@ -871,15 +878,9 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
     auto strides = mtpt.getStrides();
     if (strides.empty() || static_cast<int64_t>(strides.size()) != rank)
         return failure();
-    // Stride dispatch: preserve the old indirect-load route and replace only
-    // that path with SIMT stride_load.  In practice this means tail-axis
-    // non-power-of-two or dynamic strides; outer-axis dynamic strides can still
-    // be handled by the regular DMA/coalescing lowering.
-    // We DECLINE the rewrite for *static power-of-two* tail strides:
-    //   stride 1 -> contiguous; stride 2 (even dim) -> deinterleave;
-    //   stride >= 4 (power of two) -> (compact) strided DMA.
-    // Everything else on the tail axis (non-power-of-two static, or dynamic)
-    // falls through to the SIMT stride_load below.
+    // Debug/profiling dispatch: tail-axis jumps, including power-of-two
+    // strides, are rewritten to SIMT stride_load.  Stride 1 stays on the
+    // regular contiguous/strided DMA path.
     SmallVector<OpFoldResult> strideOfrs(strides.begin(), strides.end());
     int64_t lastStride = -1;  // -1 == dynamic (not a static constant)
     if (!shouldUseStrideLoad(strideOfrs, lastStride)) return failure();
