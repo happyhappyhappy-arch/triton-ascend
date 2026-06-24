@@ -4,7 +4,7 @@
 include "mlir/Pass/PassBase.td"
 
 def TritonControlFlowOpt : Pass<"triton-control-flow-opt", "mlir::ModuleOp"> {
-  let summary = "Normalize Triton control flow before pointer analysis";
+  let summary = "Normalize Triton control flow and predicate one-trip loops before pointer analysis";
   let constructor = "triton::createTritonControlFlowOptPass()";
 }
 
