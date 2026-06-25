@@ -24,6 +24,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -134,6 +135,12 @@ static Type lift2D(Type t, int64_t S) {
     return RankedTensorType::get({rt.getShape()[0], S}, rt.getElementType());
 }
 
+static Type lift2DColInner(Type t, int64_t S) {
+    auto rt = dyn_cast<RankedTensorType>(t);
+    if (!rt || rt.getRank() != 1) return t;
+    return RankedTensorType::get({S, rt.getShape()[0]}, rt.getElementType());
+}
+
 // An op is safe to 2D-ify (lane-parallel over the appended H axis) iff every
 // lane s computes independently: a pure elementwise arith/math op, a cast, a
 // splat, or a scan/reduce ALONG THE T axis (axis 0). On the 2D tile [BT,S] a
@@ -147,7 +154,8 @@ static bool is2DSafe(Operation *op) {
             arith::NegFOp, arith::MaximumFOp, arith::MinimumFOp,
             arith::MaxNumFOp, arith::MinNumFOp, arith::CmpFOp, arith::SelectOp,
             arith::ExtFOp, arith::TruncFOp, arith::SIToFPOp, arith::UIToFPOp,
-            arith::FPToSIOp, arith::FPToUIOp>(op))
+            arith::FPToSIOp, arith::FPToUIOp, arith::CmpIOp, arith::AndIOp,
+            arith::OrIOp>(op))
         return true;
     // Every math dialect op (exp/log/sqrt/tanh/erf/...) is a per-lane scalar
     // elementwise map -> 2D-safe. This covers gate activations expressed as
@@ -163,7 +171,7 @@ static bool is2DSafe(Operation *op) {
     return false;
 }
 
-void rewriteStridedAxisCoalesce(ModuleOp moduleOp) {
+static void rewriteBlockPtrStridedAxisCoalesce(ModuleOp moduleOp) {
     IRRewriter rw(moduleOp.getContext());
 
     // Collect the strided ih-base 1D loads (seeds). All must share one stride S
@@ -495,6 +503,760 @@ void rewriteStridedAxisCoalesce(ModuleOp moduleOp) {
     auto i32t = IntegerType::get(moduleOp.getContext(), 32);
     moduleOp->setAttr("hacc.coalesce_factor", IntegerAttr::get(i32t, S));
     moduleOp->setAttr("hacc.coalesce_axis", IntegerAttr::get(i32t, coalesceAxis));
+}
+
+// Addptr-addressed kernels do not have a structured block pointer in the input
+// IR. This side path recognizes the flattened launch/address shape directly:
+//   output_row = pid / cdiv(D, BT), group = pid % cdiv(D, BT)
+//   batch = output_row / S, h = output_row % S
+//   ptr = base + begin + h * D + (range(0, BT) + group * BT)
+// and rebuilds the load/compute/store chain as a [S,BT] tile. Keeping BT inner
+// preserves contiguous GM accesses on the column dimension.
+struct AddPtrAccess {
+    enum class RowKind { Jagged, Dense };
+
+    Value outputRow;
+    Value batch;
+    Value lane;
+    Value d;
+    Value cols;
+    Value colMask;
+    Value rowMask;
+    Value begin;
+    Value base;
+    RowKind rowKind = RowKind::Jagged;
+};
+
+struct AddPtrSeed {
+    triton::LoadOp load;
+    int64_t S = 0;
+    int64_t BT = 0;
+    int32_t coalesceAxis = -1;
+    AddPtrAccess access;
+};
+
+struct AddPtrStore {
+    triton::StoreOp store;
+    AddPtrAccess access;
+    Value base;
+    Value baseOffset;
+    bool includeBatch = true;
+};
+
+static bool matchFlattenedRowAndLane(triton::GetProgramIdOp pidOp,
+                                     Value &gridDim, Value &outputRow,
+                                     Value &group, Value &batch, Value &lane,
+                                     int64_t &S) {
+    for (Operation *user : pidOp.getResult().getUsers()) {
+        auto div = dyn_cast<arith::DivSIOp>(user);
+        if (!div || div.getLhs() != pidOp.getResult()) continue;
+
+        Value candidateGridDim = div.getRhs();
+        Value candidateGroup;
+        for (Operation *maybeRemUser : pidOp.getResult().getUsers()) {
+            auto rem = dyn_cast<arith::RemSIOp>(maybeRemUser);
+            if (rem && rem.getLhs() == pidOp.getResult() &&
+                rem.getRhs() == candidateGridDim) {
+                candidateGroup = rem.getResult();
+                break;
+            }
+        }
+        if (!candidateGroup) continue;
+
+        for (Operation *rowUser : div.getResult().getUsers()) {
+            auto batchDiv = dyn_cast<arith::DivSIOp>(rowUser);
+            if (!batchDiv || batchDiv.getLhs() != div.getResult()) continue;
+            auto candidateS = getConstantIntValue(batchDiv.getRhs());
+            if (!candidateS || *candidateS <= 1) continue;
+
+            Value candidateLane;
+            for (Operation *maybeLaneUser : div.getResult().getUsers()) {
+                auto rem = dyn_cast<arith::RemSIOp>(maybeLaneUser);
+                auto remS = rem ? getConstantIntValue(rem.getRhs()) : std::nullopt;
+                if (rem && rem.getLhs() == div.getResult() && remS &&
+                    *remS == *candidateS) {
+                    candidateLane = rem.getResult();
+                    break;
+                }
+            }
+
+            gridDim = candidateGridDim;
+            outputRow = div.getResult();
+            group = candidateGroup;
+            batch = batchDiv.getResult();
+            lane = candidateLane;
+            S = *candidateS;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool matchColumnOffsets(Value cols, Value group, Value &d,
+                               Value &colMask, int64_t &BT) {
+    auto add = cols.getDefiningOp<arith::AddIOp>();
+    if (!add) return false;
+
+    triton::MakeRangeOp range;
+    Value colBase;
+    if ((range = add.getLhs().getDefiningOp<triton::MakeRangeOp>())) {
+        if (auto splat = add.getRhs().getDefiningOp<triton::SplatOp>())
+            colBase = splat.getSrc();
+    } else if ((range = add.getRhs().getDefiningOp<triton::MakeRangeOp>())) {
+        if (auto splat = add.getLhs().getDefiningOp<triton::SplatOp>())
+            colBase = splat.getSrc();
+    }
+    if (!range || range.getStart() != 0 || !colBase) return false;
+
+    BT = range.getEnd();
+    auto colBaseMul = colBase.getDefiningOp<arith::MulIOp>();
+    if (BT <= 1 || !colBaseMul) return false;
+    auto lhsConst = getConstantIntValue(colBaseMul.getLhs());
+    auto rhsConst = getConstantIntValue(colBaseMul.getRhs());
+    if (!((colBaseMul.getLhs() == group && rhsConst && *rhsConst == BT) ||
+          (colBaseMul.getRhs() == group && lhsConst && *lhsConst == BT)))
+        return false;
+
+    for (Operation *user : cols.getUsers()) {
+        auto cmp = dyn_cast<arith::CmpIOp>(user);
+        if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt ||
+            cmp.getLhs() != cols)
+            continue;
+        auto splat = cmp.getRhs().getDefiningOp<triton::SplatOp>();
+        if (!splat) continue;
+        d = splat.getSrc();
+        colMask = cmp.getResult();
+        return true;
+    }
+    return false;
+}
+
+static bool matchBeginEnd(Value batch, Value &begin) {
+    for (Operation *user : batch.getUsers()) {
+        auto beginPtr = dyn_cast<triton::AddPtrOp>(user);
+        if (!beginPtr || beginPtr.getOffset() != batch) continue;
+
+        triton::LoadOp beginLoad;
+        for (Operation *ptrUser : beginPtr.getResult().getUsers()) {
+            beginLoad = dyn_cast<triton::LoadOp>(ptrUser);
+            if (beginLoad) break;
+        }
+        if (!beginLoad) continue;
+
+        Value base = beginPtr.getPtr();
+        for (Operation *batchUser : batch.getUsers()) {
+            auto add = dyn_cast<arith::AddIOp>(batchUser);
+            if (!add ||
+                !((add.getLhs() == batch && getConstantIntValue(add.getRhs()) &&
+                   *getConstantIntValue(add.getRhs()) == 1) ||
+                  (add.getRhs() == batch && getConstantIntValue(add.getLhs()) &&
+                   *getConstantIntValue(add.getLhs()) == 1)))
+                continue;
+            for (Operation *nextUser : add.getResult().getUsers()) {
+                auto endPtr = dyn_cast<triton::AddPtrOp>(nextUser);
+                if (!endPtr || endPtr.getPtr() != base ||
+                    endPtr.getOffset() != add.getResult())
+                    continue;
+                for (Operation *ptrUser : endPtr.getResult().getUsers()) {
+                    auto endLoad = dyn_cast<triton::LoadOp>(ptrUser);
+                    if (!endLoad) continue;
+                    begin = beginLoad.getResult();
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool matchJaggedRowPtr(Value rowPtr, Value begin, Value lane, Value d,
+                              Value &base) {
+    auto addPtr = rowPtr.getDefiningOp<triton::AddPtrOp>();
+    if (!addPtr) return false;
+    auto add = addPtr.getOffset().getDefiningOp<arith::AddIOp>();
+    if (!add) return false;
+
+    Value laneOffset = add.getLhs() == begin ? add.getRhs() : add.getLhs();
+    while (true) {
+        if (auto e = laneOffset.getDefiningOp<arith::ExtSIOp>()) {
+            laneOffset = e.getIn();
+            continue;
+        }
+        if (auto t = laneOffset.getDefiningOp<arith::TruncIOp>()) {
+            laneOffset = t.getIn();
+            continue;
+        }
+        break;
+    }
+    auto laneMul = laneOffset.getDefiningOp<arith::MulIOp>();
+    if (!((add.getLhs() == begin || add.getRhs() == begin) && laneMul &&
+          ((laneMul.getLhs() == lane && laneMul.getRhs() == d) ||
+           (laneMul.getLhs() == d && laneMul.getRhs() == lane))))
+        return false;
+
+    base = addPtr.getPtr();
+    return true;
+}
+
+static bool matchDenseRowPtr(Value rowPtr, Value outputRow, Value d,
+                             Value &base) {
+    auto addPtr = rowPtr.getDefiningOp<triton::AddPtrOp>();
+    auto mul = addPtr ? addPtr.getOffset().getDefiningOp<arith::MulIOp>()
+                      : arith::MulIOp();
+    if (!addPtr || !mul ||
+        !((mul.getLhs() == outputRow && mul.getRhs() == d) ||
+          (mul.getLhs() == d && mul.getRhs() == outputRow)))
+        return false;
+    base = addPtr.getPtr();
+    return true;
+}
+
+static bool matchLoadMask(Value mask, Value colMask, Value &rowMask) {
+    if (mask == colMask) return true;
+    auto andOp = mask.getDefiningOp<arith::AndIOp>();
+    if (!andOp) return false;
+    if (andOp.getLhs() == colMask) {
+        if (auto splat = andOp.getRhs().getDefiningOp<triton::SplatOp>())
+            rowMask = splat.getSrc();
+        return static_cast<bool>(rowMask);
+    }
+    if (andOp.getRhs() == colMask) {
+        if (auto splat = andOp.getLhs().getDefiningOp<triton::SplatOp>())
+            rowMask = splat.getSrc();
+        return static_cast<bool>(rowMask);
+    }
+    return false;
+}
+
+static bool matchAddPtrLoad(triton::LoadOp load, AddPtrSeed &seed) {
+    auto vectorType = dyn_cast<RankedTensorType>(load.getType());
+    if (!vectorType || vectorType.getRank() != 1) return false;
+    auto addPtr = load.getPtr().getDefiningOp<triton::AddPtrOp>();
+    if (!addPtr) return false;
+    Value rowPtr;
+    if (auto splat = addPtr.getPtr().getDefiningOp<triton::SplatOp>())
+        rowPtr = splat.getSrc();
+    if (!rowPtr) return false;
+
+    auto func = load->getParentOfType<triton::FuncOp>();
+    if (!func) return false;
+    Block &body = func.getBody().front();
+    for (Operation &op : body) {
+        auto pid = dyn_cast<triton::GetProgramIdOp>(op);
+        if (!pid) continue;
+
+        AddPtrAccess candidate;
+        Value gridDim;
+        Value group;
+        int64_t S = 0;
+        int64_t BT = 0;
+        if (!matchFlattenedRowAndLane(pid, gridDim, candidate.outputRow,
+                                      group, candidate.batch, candidate.lane,
+                                      S))
+            continue;
+        if (!matchColumnOffsets(addPtr.getOffset(), group, candidate.d,
+                                candidate.colMask, BT))
+            continue;
+        auto gridDiv = gridDim.getDefiningOp<arith::DivSIOp>();
+        auto gridBiasAdd = gridDiv
+                               ? gridDiv.getLhs().getDefiningOp<arith::AddIOp>()
+                               : arith::AddIOp();
+        int64_t bias = BT - 1;
+        bool isCdiv = false;
+        if (gridDiv && gridBiasAdd) {
+            auto gridDivisor = getConstantIntValue(gridDiv.getRhs());
+            auto lhsBias = getConstantIntValue(gridBiasAdd.getRhs());
+            auto rhsBias = getConstantIntValue(gridBiasAdd.getLhs());
+            isCdiv = gridDivisor && *gridDivisor == BT &&
+                     ((gridBiasAdd.getLhs() == candidate.d && lhsBias &&
+                       *lhsBias == bias) ||
+                      (gridBiasAdd.getRhs() == candidate.d && rhsBias &&
+                       *rhsBias == bias));
+        }
+        if (vectorType.getShape()[0] != BT || !isCdiv)
+            continue;
+        if (!load.getMask() ||
+            !matchLoadMask(load.getMask(), candidate.colMask,
+                           candidate.rowMask))
+            continue;
+        if (matchDenseRowPtr(rowPtr, candidate.outputRow, candidate.d,
+                             candidate.base)) {
+            candidate.rowKind = AddPtrAccess::RowKind::Dense;
+        } else {
+            if (!matchBeginEnd(candidate.batch, candidate.begin)) continue;
+            if (!matchJaggedRowPtr(rowPtr, candidate.begin, candidate.lane,
+                                   candidate.d, candidate.base))
+                continue;
+            candidate.rowKind = AddPtrAccess::RowKind::Jagged;
+        }
+
+        candidate.cols = addPtr.getOffset();
+        seed.load = load;
+        seed.S = S;
+        seed.BT = BT;
+        seed.coalesceAxis = pid.getAxisAsInt();
+        seed.access = candidate;
+        return true;
+    }
+    return false;
+}
+
+static bool matchAddPtrStore(triton::StoreOp store, ArrayRef<AddPtrSeed> seeds,
+                             AddPtrStore &sink) {
+    for (const AddPtrSeed &seed : seeds) {
+        auto addPtr = store.getPtr().getDefiningOp<triton::AddPtrOp>();
+        if (!addPtr || addPtr.getOffset() != seed.access.cols) continue;
+        Value rowPtr;
+        if (auto splat = addPtr.getPtr().getDefiningOp<triton::SplatOp>())
+            rowPtr = splat.getSrc();
+        if (!rowPtr || store.getMask() != seed.access.colMask) continue;
+
+        Value base;
+        Value baseOffset;
+        bool includeBatch = true;
+        if (!matchDenseRowPtr(rowPtr, seed.access.outputRow, seed.access.d,
+                              base)) {
+            if (!seed.access.begin ||
+                !matchJaggedRowPtr(rowPtr, seed.access.begin,
+                                   seed.access.lane, seed.access.d, base))
+                continue;
+            baseOffset = seed.access.begin;
+            includeBatch = false;
+        }
+
+        sink.store = store;
+        sink.access = seed.access;
+        sink.base = base;
+        sink.baseOffset = baseOffset;
+        sink.includeBatch = includeBatch;
+        return true;
+    }
+    return false;
+}
+
+static Value buildAddPtrOffsets2D(IRRewriter &rw, Location loc,
+                                  const AddPtrAccess &access, int64_t S,
+                                  int64_t BT, Value baseOffset,
+                                  bool includeBatch) {
+    Type i32Ty = rw.getI32Type();
+    Type i64Ty = rw.getI64Type();
+    auto hI32Ty = RankedTensorType::get({S}, i32Ty);
+    auto hI64Ty = RankedTensorType::get({S}, i64Ty);
+    auto tileI64Ty = RankedTensorType::get({S, BT}, i64Ty);
+
+    Value cS = rw.create<arith::ConstantIntOp>(loc, S, 32);
+    Value hs = rw.create<triton::MakeRangeOp>(loc, hI32Ty, 0, S);
+    Value rowBase = hs;
+    if (includeBatch) {
+        Value batchS = rw.create<arith::MulIOp>(loc, access.batch, cS);
+        Value batchSplat = rw.create<triton::SplatOp>(
+            loc, RankedTensorType::get({S}, i32Ty), batchS);
+        rowBase = rw.create<arith::AddIOp>(loc, batchSplat, hs);
+    }
+    Value dRows = rw.create<triton::SplatOp>(
+        loc, RankedTensorType::get({S}, i32Ty), access.d);
+    Value rowTimesD = rw.create<arith::MulIOp>(loc, rowBase, dRows);
+    Value rowTimesD64 = rw.create<arith::ExtSIOp>(loc, hI64Ty, rowTimesD);
+    Value expandedRows = rw.create<triton::ExpandDimsOp>(loc, rowTimesD64, 1);
+    Value rowOffsets2d =
+        rw.create<triton::BroadcastOp>(loc, tileI64Ty, expandedRows);
+
+    auto colI64Ty = RankedTensorType::get({BT}, i64Ty);
+    Value cols64 = rw.create<arith::ExtSIOp>(loc, colI64Ty, access.cols);
+    Value expandedCols = rw.create<triton::ExpandDimsOp>(loc, cols64, 0);
+    Value cols2d = rw.create<triton::BroadcastOp>(loc, tileI64Ty,
+                                                  expandedCols);
+    Value offsets = rw.create<arith::AddIOp>(loc, rowOffsets2d, cols2d);
+    if (baseOffset) {
+        Value base2d = rw.create<triton::SplatOp>(
+            loc, RankedTensorType::get({S, BT}, i64Ty), baseOffset);
+        offsets = rw.create<arith::AddIOp>(loc, base2d, offsets);
+    }
+    return offsets;
+}
+
+static Value buildAddPtrLoad2D(IRRewriter &rw, const AddPtrSeed &seed,
+                               const std::function<Value(Value)> &get2D) {
+    triton::LoadOp load = seed.load;
+    rw.setInsertionPoint(load);
+    Value other = load.getOther() ? get2D(load.getOther()) : Value();
+    if (load.getOther() && !other) return Value();
+    const AddPtrAccess &access = seed.access;
+    Location loc = load.getLoc();
+    auto tileType = cast<RankedTensorType>(lift2DColInner(load.getType(),
+                                                          seed.S));
+    auto tilePtrType =
+        RankedTensorType::get({seed.S, seed.BT}, access.base.getType());
+    auto tileI1Ty =
+        RankedTensorType::get({seed.S, seed.BT}, rw.getI1Type());
+
+    Value offsets = buildAddPtrOffsets2D(
+        rw, loc, access, seed.S, seed.BT,
+        access.rowKind == AddPtrAccess::RowKind::Jagged ? access.begin
+                                                        : Value(),
+        access.rowKind == AddPtrAccess::RowKind::Dense);
+    Value base = rw.create<triton::SplatOp>(loc, tilePtrType, access.base);
+    Value ptrs = rw.create<triton::AddPtrOp>(loc, tilePtrType, base, offsets);
+
+    Value expandedColMask = rw.create<triton::ExpandDimsOp>(loc,
+                                                            access.colMask, 0);
+    Value colMask2d = rw.create<triton::BroadcastOp>(loc, tileI1Ty,
+                                                     expandedColMask);
+    Value mask = colMask2d;
+    if (access.rowMask) {
+        Value rowMask2d = rw.create<triton::SplatOp>(
+            loc, RankedTensorType::get({seed.S, seed.BT}, rw.getI1Type()),
+            access.rowMask);
+        mask = rw.create<arith::AndIOp>(loc, colMask2d, rowMask2d);
+    }
+    if (!other) {
+        Attribute zero = rw.getZeroAttr(tileType.getElementType());
+        other = rw.create<arith::ConstantOp>(
+            loc, DenseElementsAttr::get(tileType, zero));
+    }
+    return rw.create<triton::LoadOp>(
+                 loc, ptrs, mask, other, ArrayRef<int32_t>{}, nullptr,
+                 load.getCache(), load.getEvict(), load.getIsVolatile())
+        .getResult();
+}
+
+static Value buildDenseLoad2D(IRRewriter &rw, triton::LoadOp load,
+                              const AddPtrSeed &seed, Value base) {
+    rw.setInsertionPoint(load);
+    const AddPtrAccess &access = seed.access;
+    Location loc = load.getLoc();
+    Type elemTy = load.getType();
+    Type i32Ty = rw.getI32Type();
+    auto hI32Ty = RankedTensorType::get({seed.S}, i32Ty);
+    auto hElemTy = RankedTensorType::get({seed.S}, elemTy);
+    auto hPtrTy = RankedTensorType::get({seed.S}, base.getType());
+
+    Value cS = rw.create<arith::ConstantIntOp>(loc, seed.S, 32);
+    Value hs = rw.create<triton::MakeRangeOp>(loc, hI32Ty, 0, seed.S);
+    Value batchS = rw.create<arith::MulIOp>(loc, access.batch, cS);
+    Value batchSplat = rw.create<triton::SplatOp>(
+        loc, RankedTensorType::get({seed.S}, i32Ty), batchS);
+    Value offsets = rw.create<arith::AddIOp>(loc, batchSplat, hs);
+    Value baseSplat = rw.create<triton::SplatOp>(loc, hPtrTy, base);
+    Value ptrs = rw.create<triton::AddPtrOp>(loc, hPtrTy, baseSplat, offsets);
+    Value mask = Value();
+    if (access.rowMask)
+        mask = rw.create<triton::SplatOp>(
+            loc, RankedTensorType::get({seed.S}, rw.getI1Type()),
+            access.rowMask);
+    Attribute zero = rw.getZeroAttr(hElemTy.getElementType());
+    Value other = rw.create<arith::ConstantOp>(
+        loc, DenseElementsAttr::get(hElemTy, zero));
+    return rw.create<triton::LoadOp>(
+                 loc, ptrs, mask, other, ArrayRef<int32_t>{}, nullptr,
+                 load.getCache(), load.getEvict(), load.getIsVolatile())
+        .getResult();
+}
+
+static bool buildAddPtrStore2D(IRRewriter &rw, const AddPtrStore &sink,
+                               Value value, int64_t S, int64_t BT) {
+    triton::StoreOp store = sink.store;
+    rw.setInsertionPoint(store);
+    const AddPtrAccess &access = sink.access;
+    Location loc = store.getLoc();
+    auto tilePtrType = RankedTensorType::get({S, BT}, sink.base.getType());
+    auto tileI1Ty = RankedTensorType::get({S, BT}, rw.getI1Type());
+    Value offsets = buildAddPtrOffsets2D(rw, loc, access, S, BT,
+                                         sink.baseOffset, sink.includeBatch);
+    Value baseSplat = rw.create<triton::SplatOp>(loc, tilePtrType, sink.base);
+    Value ptrs = rw.create<triton::AddPtrOp>(loc, tilePtrType, baseSplat,
+                                             offsets);
+    Value expandedMask = rw.create<triton::ExpandDimsOp>(loc, access.colMask,
+                                                         0);
+    Value mask = rw.create<triton::BroadcastOp>(loc, tileI1Ty, expandedMask);
+    rw.create<triton::StoreOp>(loc, ptrs, value, mask);
+    return true;
+}
+
+static void rewriteAddPtrStridedAxisCoalesce(ModuleOp moduleOp) {
+    if (moduleOp->hasAttr("hacc.coalesce_factor"))
+        return;
+
+    AddPtrSeed rootSeed;
+    bool foundRoot = false;
+    moduleOp.walk([&](triton::LoadOp load) {
+        if (foundRoot) return;
+        foundRoot = matchAddPtrLoad(load, rootSeed);
+    });
+    if (!foundRoot) return;
+
+    int64_t S = rootSeed.S, BT = rootSeed.BT;
+    int32_t coalesceAxis = rootSeed.coalesceAxis;
+    if (S <= 1 || BT <= 0 || coalesceAxis < 0) return;
+
+    bool readsAxisNumPrograms = false;
+    moduleOp.walk([&](triton::GetNumProgramsOp np) {
+        if (np.getAxisAsInt() == coalesceAxis) readsAxisNumPrograms = true;
+    });
+    if (readsAxisNumPrograms) return;
+
+    SmallVector<AddPtrSeed> seeds{rootSeed};
+    moduleOp.walk([&](triton::LoadOp load) {
+        if (load == rootSeed.load) return;
+        AddPtrSeed seed;
+        if (!matchAddPtrLoad(load, seed)) return;
+        if (seed.S != S || seed.BT != BT || seed.coalesceAxis != coalesceAxis)
+            return;
+        seeds.push_back(seed);
+    });
+
+    DenseSet<Operation *> seedOps;
+    for (AddPtrSeed seed : seeds)
+        seedOps.insert(seed.load.getOperation());
+
+    SmallVector<triton::LoadOp> denseLoads;
+    DenseMap<Operation *, Value> denseBases;
+    DenseMap<Operation *, unsigned> denseSeedIndex;
+    DenseSet<Operation *> seenDenseLoads;
+    for (unsigned i = 0; i < seeds.size(); ++i) {
+        const AddPtrSeed &seed = seeds[i];
+        moduleOp.walk([&](triton::LoadOp load) {
+            if (seedOps.contains(load.getOperation())) return;
+            if (isa<RankedTensorType>(load.getType())) return;
+            Value ptr = load.getPtr();
+            if (auto addPtr = ptr.getDefiningOp<triton::AddPtrOp>()) {
+                auto zero = getConstantIntValue(addPtr.getOffset());
+                if (zero && *zero == 0)
+                    ptr = addPtr.getPtr();
+            }
+            auto addPtr = ptr.getDefiningOp<triton::AddPtrOp>();
+            if (!addPtr || addPtr.getOffset() != seed.access.outputRow) return;
+            if (load.getMask() && seed.access.rowMask &&
+                load.getMask() != seed.access.rowMask)
+                return;
+            if (!seenDenseLoads.insert(load.getOperation()).second) return;
+            denseLoads.push_back(load);
+            denseBases[load.getOperation()] = addPtr.getPtr();
+            denseSeedIndex[load.getOperation()] = i;
+        });
+    }
+
+    DenseSet<Operation *> region;
+    SmallVector<triton::StoreOp> sinks;
+    DenseSet<Operation *> visited;
+    SmallVector<Operation *> wl;
+    for (AddPtrSeed seed : seeds)
+        for (Operation *user : seed.load.getResult().getUsers())
+            wl.push_back(user);
+    while (!wl.empty()) {
+        Operation *op = wl.pop_back_val();
+        if (!visited.insert(op).second) continue;
+        if (auto st = dyn_cast<triton::StoreOp>(op)) {
+            sinks.push_back(st);
+            continue;
+        }
+        if (!is2DSafe(op)) return;
+        region.insert(op);
+        for (Value result : op->getResults())
+            for (Operation *user : result.getUsers())
+                wl.push_back(user);
+    }
+    if (sinks.empty()) return;
+
+    SmallVector<AddPtrStore> coalescedStores;
+    for (triton::StoreOp st : sinks) {
+        AddPtrStore store;
+        if (!matchAddPtrStore(st, seeds, store))
+            return;
+        coalescedStores.push_back(store);
+    }
+
+    IRRewriter rw(moduleOp.getContext());
+    DenseMap<Value, Value> vmap;
+    std::function<Value(Value)> get2D = [&](Value v) -> Value {
+        auto it = vmap.find(v);
+        if (it != vmap.end()) return it->second;
+        if (!isa<RankedTensorType>(v.getType())) {
+            Operation *def = v.getDefiningOp();
+            bool liftable = def && (isa<math::MathDialect>(def->getDialect()) ||
+                isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+                    arith::NegFOp, arith::MaximumFOp, arith::MinimumFOp,
+                    arith::MaxNumFOp, arith::MinNumFOp, arith::ExtFOp,
+                    arith::TruncFOp>(def));
+            if (liftable) {
+                SmallVector<Value> ops2;
+                bool anyLane = false;
+                for (Value operand : def->getOperands()) {
+                    Value n = get2D(operand);
+                    if (!n) return Value();
+                    if (isa<RankedTensorType>(n.getType())) anyLane = true;
+                    ops2.push_back(n);
+                }
+                if (anyLane) {
+                    OpBuilder::InsertionGuard guard(rw);
+                    rw.setInsertionPointAfter(def);
+                    for (Value &operand : ops2)
+                        if (!isa<RankedTensorType>(operand.getType()))
+                            operand = rw.create<triton::SplatOp>(
+                                def->getLoc(),
+                                RankedTensorType::get({S}, operand.getType()),
+                                operand);
+                    OperationState st(def->getLoc(), def->getName());
+                    st.addOperands(ops2);
+                    st.addAttributes(def->getAttrs());
+                    for (Value result : def->getResults())
+                        st.addTypes(RankedTensorType::get({S},
+                                                          result.getType()));
+                    Operation *nu = rw.create(st);
+                    vmap[v] = nu->getResult(0);
+                    return nu->getResult(0);
+                }
+            }
+            return v;
+        }
+
+        OpBuilder::InsertionGuard guard(rw);
+        if (auto sp = v.getDefiningOp<triton::SplatOp>()) {
+            Value src2 = get2D(sp.getSrc());
+            if (!src2) return Value();
+            rw.setInsertionPointAfter(sp);
+            Value n;
+            if (isa<RankedTensorType>(src2.getType())) {
+                Value ex = rw.create<triton::ExpandDimsOp>(sp.getLoc(), src2,
+                                                           1);
+                n = rw.create<triton::BroadcastOp>(
+                    sp.getLoc(), lift2DColInner(sp.getType(), S), ex);
+            } else {
+                n = rw.create<triton::SplatOp>(
+                    sp.getLoc(), lift2DColInner(sp.getType(), S), src2);
+            }
+            vmap[v] = n;
+            return n;
+        }
+        if (auto c = v.getDefiningOp<arith::ConstantOp>()) {
+            if (auto dea = dyn_cast<DenseElementsAttr>(c.getValue())) {
+                if (dea.isSplat()) {
+                    auto nt = cast<RankedTensorType>(
+                        lift2DColInner(c.getType(), S));
+                    rw.setInsertionPointAfter(c);
+                    Value n = rw.create<arith::ConstantOp>(
+                        c.getLoc(), nt,
+                        DenseElementsAttr::get(nt,
+                                                dea.getSplatValue<Attribute>()));
+                    vmap[v] = n;
+                    return n;
+                }
+            }
+        }
+        if (Operation *def = v.getDefiningOp()) {
+            if (is2DSafe(def) && def->getNumResults() == 1) {
+                SmallVector<Value> operands;
+                bool any2D = false;
+                for (Value operand : def->getOperands()) {
+                    Value n = get2D(operand);
+                    if (!n) return Value();
+                    if (isa<RankedTensorType>(n.getType())) any2D = true;
+                    operands.push_back(n);
+                }
+                if (any2D) {
+                    rw.setInsertionPointAfter(def);
+                    OperationState st(def->getLoc(), def->getName());
+                    st.addOperands(operands);
+                    st.addAttributes(def->getAttrs());
+                    st.addTypes(lift2DColInner(def->getResult(0).getType(),
+                                               S));
+                    Operation *nu = rw.create(st);
+                    vmap[v] = nu->getResult(0);
+                    return nu->getResult(0);
+                }
+            }
+        }
+        return Value();
+    };
+
+    for (AddPtrSeed seed : seeds) {
+        Value load2D = buildAddPtrLoad2D(rw, seed, get2D);
+        if (!load2D) return;
+        vmap[seed.load.getResult()] = load2D;
+    }
+    for (triton::LoadOp load : denseLoads) {
+        auto baseIt = denseBases.find(load.getOperation());
+        auto seedIt = denseSeedIndex.find(load.getOperation());
+        if (baseIt == denseBases.end() || seedIt == denseSeedIndex.end())
+            return;
+        vmap[load.getResult()] = buildDenseLoad2D(rw, load,
+                                                  seeds[seedIt->second],
+                                                  baseIt->second);
+    }
+
+    SmallVector<Operation *> ordered;
+    moduleOp.walk([&](Operation *op) {
+        if (region.count(op)) ordered.push_back(op);
+    });
+    for (Operation *op : ordered) {
+        rw.setInsertionPoint(op);
+        if (auto scan = dyn_cast<triton::ScanOp>(op)) {
+            Value in = get2D(scan.getOperand(0));
+            if (!in) return;
+            auto ns = rw.create<triton::ScanOp>(scan.getLoc(), ValueRange{in},
+                                                scan.getAxis() + 1,
+                                                scan.getReverse());
+            rw.cloneRegionBefore(scan.getCombineOp(), ns.getCombineOp(),
+                                 ns.getCombineOp().end());
+            vmap[scan->getResult(0)] = ns->getResult(0);
+            continue;
+        }
+        if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
+            Value in = get2D(reduce.getOperand(0));
+            if (!in) return;
+            auto nr = rw.create<triton::ReduceOp>(reduce.getLoc(),
+                                                  ValueRange{in},
+                                                  reduce.getAxis() + 1);
+            rw.cloneRegionBefore(reduce.getCombineOp(), nr.getCombineOp(),
+                                 nr.getCombineOp().end());
+            vmap[reduce->getResult(0)] = nr->getResult(0);
+            continue;
+        }
+        if (isa<triton::SplatOp>(op)) continue;
+        SmallVector<Value> operands;
+        for (Value operand : op->getOperands()) {
+            Value n = get2D(operand);
+            if (!n) return;
+            operands.push_back(n);
+        }
+        OperationState st(op->getLoc(), op->getName());
+        st.addOperands(operands);
+        st.addAttributes(op->getAttrs());
+        for (Value result : op->getResults())
+            st.addTypes(lift2DColInner(result.getType(), S));
+        Operation *nu = rw.create(st);
+        for (auto [oldR, newR] : llvm::zip(op->getResults(), nu->getResults()))
+            vmap[oldR] = newR;
+    }
+
+    for (const AddPtrStore &store : coalescedStores) {
+        triton::StoreOp st = store.store;
+        Value val = get2D(st.getValue());
+        if (!val) return;
+        if (!buildAddPtrStore2D(rw, store, val, S, BT))
+            return;
+    }
+
+    rw.replaceAllUsesWith(seeds.front().access.batch,
+                          seeds.front().access.outputRow);
+
+    for (triton::StoreOp st : sinks) rw.eraseOp(st);
+    for (auto it = ordered.rbegin(); it != ordered.rend(); ++it)
+        rw.eraseOp(*it);
+    for (AddPtrSeed seed : seeds)
+        rw.eraseOp(seed.load);
+
+    auto i32t = IntegerType::get(moduleOp.getContext(), 32);
+    moduleOp->setAttr("hacc.coalesce_factor", IntegerAttr::get(i32t, S));
+    moduleOp->setAttr("hacc.coalesce_axis",
+                      IntegerAttr::get(i32t, coalesceAxis));
+}
+
+void rewriteStridedAxisCoalesce(ModuleOp moduleOp) {
+    rewriteBlockPtrStridedAxisCoalesce(moduleOp);
+    if (moduleOp->hasAttr("hacc.coalesce_factor"))
+        return;
+    rewriteAddPtrStridedAxisCoalesce(moduleOp);
 }
 
 }  // namespace StridedAxisCoalescing
