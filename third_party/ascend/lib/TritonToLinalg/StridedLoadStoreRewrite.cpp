@@ -35,6 +35,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/BuiltinOps.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 
 #include <cstdlib>
@@ -115,10 +116,42 @@ static bool shouldRouteMaskedSingleTilePow2ToIndirect(
     return upperBound && *upperBound <= blockSize;
 }
 
-// Cheaply detect tensor-level static stride > 1 before running PtrAnalysis,
-// which mutates IR. Dynamic stride stays on the structured SIMD path, and
-// scalar offset arithmetic does not affect per-element stride.
-static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
+static bool isStaticNonUnitPowerOfTwo(int64_t stride) {
+    int64_t absStride = std::abs(stride);
+    return absStride > 1 && ((absStride & (absStride - 1)) == 0);
+}
+
+static bool shouldUseSimtStride(std::optional<int64_t> stride) {
+    if (!stride.has_value())
+        return true;
+    int64_t absStride = std::abs(stride.value());
+    return absStride > 1 && ((absStride & (absStride - 1)) != 0);
+}
+
+static bool shouldUseSimtStride(OpFoldResult stride) {
+    return shouldUseSimtStride(getConstantIntValue(stride));
+}
+
+static bool shouldUseSimtStride(Value stride) {
+    return shouldUseSimtStride(getStaticConstInt(stride));
+}
+
+static bool shouldUseSimtStride(ArrayRef<OpFoldResult> strides) {
+    return llvm::any_of(strides, [](OpFoldResult stride) {
+        return shouldUseSimtStride(stride);
+    });
+}
+
+static bool shouldUseSimtStride(ValueRange strides) {
+    return llvm::any_of(strides, [](Value stride) {
+        return shouldUseSimtStride(stride);
+    });
+}
+
+// Cheaply detect tensor-level non-unit/dynamic stride before running
+// PtrAnalysis, which mutates IR. Scalar offset arithmetic does not affect
+// per-element stride.
+static bool offsetMayContainNonUnitStride(Value offset, int depthBudget = 16) {
     if (depthBudget <= 0) {
         return true;  // Give up cheaply and let PtrAnalysis decide downstream.
     }
@@ -134,8 +167,14 @@ static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
             isStaticConstAbsGtOne(mul.getRhs())) {
             return true;
         }
-        return offsetMayContainStrideGtOne(mul.getLhs(), depthBudget - 1) ||
-               offsetMayContainStrideGtOne(mul.getRhs(), depthBudget - 1);
+        auto lhsConst = getStaticConstInt(mul.getLhs());
+        auto rhsConst = getStaticConstInt(mul.getRhs());
+        if ((lhsConst && std::abs(*lhsConst) <= 1) ||
+            (rhsConst && std::abs(*rhsConst) <= 1)) {
+            return offsetMayContainNonUnitStride(mul.getLhs(), depthBudget - 1) ||
+                   offsetMayContainNonUnitStride(mul.getRhs(), depthBudget - 1);
+        }
+        return true;
     }
     // arith.shli %a, %k effectively multiplies by 2^k; treat shift by >=1 as
     // "may contain stride > 1".
@@ -151,10 +190,10 @@ static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
             denseAttr.getSplatValue<llvm::APInt>().getSExtValue() >= 1) {
             return true;
         }
-        return offsetMayContainStrideGtOne(shl.getLhs(), depthBudget - 1);
+        return true;
     }
     for (Value operand : defOp->getOperands()) {
-        if (offsetMayContainStrideGtOne(operand, depthBudget - 1)) {
+        if (offsetMayContainNonUnitStride(operand, depthBudget - 1)) {
             return true;
         }
     }
@@ -658,9 +697,9 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
     Value scalarBase = getScalarBasePtr(addPtrOp.getPtr());
     if (!scalarBase) return failure();
 
-    // Pre-filter without mutating IR: if no per-element multiplication by a
-    // constant > 1 exists in the offset chain, last stride must be 1.
-    if (!offsetMayContainStrideGtOne(addPtrOp.getOffset())) {
+    // Pre-filter without mutating IR: if no per-element non-unit/dynamic
+    // multiplication exists in the offset chain, last stride must be 1.
+    if (!offsetMayContainNonUnitStride(addPtrOp.getOffset())) {
         return failure();
     }
 
@@ -681,21 +720,18 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
     ptrState.analyzePermute();
     if (ptrState.isPermuted) return markInspectedAndReturn();
 
-    // Use SIMT indirect only for static non-pow2 or masked single-tile pow2
-    // strides; keep dynamic strides on the structured SIMD path.
+    SmallVector<OpFoldResult> analyzedStrides;
+    analyzedStrides.reserve(ptrState.stateInfo.size());
+    for (const auto &stateInfo : ptrState.stateInfo)
+        analyzedStrides.push_back(stateInfo.stride);
     auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
-    if (!lastStrideOpt.has_value()) return markInspectedAndReturn();
-    int64_t lastStride = std::abs(lastStrideOpt.value());
-    if (lastStride <= 1) return markInspectedAndReturn();
+    bool useStrideLoad = shouldUseSimtStride(analyzedStrides);
     bool routeMaskedPow2ToIndirect =
+        !useStrideLoad && lastStrideOpt.has_value() &&
+        isStaticNonUnitPowerOfTwo(lastStrideOpt.value()) &&
         shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), resultType);
-    if (lastStride == 2 && !routeMaskedPow2ToIndirect)
-        return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
-    if ((lastStride & (lastStride - 1)) == 0 &&
-        !routeMaskedPow2ToIndirect)
-        return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
-
-    bool useStrideLoad = !routeMaskedPow2ToIndirect;
+    if (!useStrideLoad && !routeMaskedPow2ToIndirect)
+        return markInspectedAndReturn();
     if (useStrideLoad && resultType.getRank() >= 1 &&
         resultType.getRank() <= 3 &&
         resultType.hasStaticShape() &&
@@ -744,7 +780,12 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
                     << "----------------------------------------------\n";
                 llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr]: tt.load -> "
                                 "ttasc.stride_load\n";
-                llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+                llvm::dbgs() << "  last_stride = ";
+                if (lastStrideOpt.has_value())
+                    llvm::dbgs() << std::abs(lastStrideOpt.value());
+                else
+                    llvm::dbgs() << "dynamic";
+                llvm::dbgs() << "\n";
                 llvm::dbgs() << strideLoadResult.getDefiningOp() << "\n";
                 llvm::dbgs()
                     << "----------------------------------------------\n";
@@ -779,7 +820,12 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
         llvm::dbgs() << "----------------------------------------------\n";
         llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr]: tt.load -> "
                         "tt.indirect_load\n";
-        llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+        llvm::dbgs() << "  last_stride = ";
+        if (lastStrideOpt.has_value())
+            llvm::dbgs() << std::abs(lastStrideOpt.value());
+        else
+            llvm::dbgs() << "dynamic";
+        llvm::dbgs() << "\n";
         llvm::dbgs() << indirectLoad << "\n";
         llvm::dbgs() << "----------------------------------------------\n";
     });
@@ -818,20 +864,12 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
     auto strides = mtpt.getStrides();
     if (strides.empty() || static_cast<int64_t>(strides.size()) != rank)
         return failure();
-    // Stride dispatch: strided DMA on the MTE engine only supports power-of-two
-    // strides; a non-power-of-two stride would degrade to a slow scalar access.
-    // Dynamic strides stay on the structured SIMD path because they may be
-    // runtime stride 1 or power-of-two, where SIMT stride is slower. So we
-    // only rewrite to SIMT stride for *static non-power-of-two* strides:
-    //   stride 1 -> contiguous; stride 2 (even dim) -> deinterleave;
-    //   stride >= 4 (power of two) -> (compact) strided DMA.
-    APInt lastStrideC;
-    if (!matchPattern(strides.back(), m_ConstantInt(&lastStrideC)))
+    // Stride dispatch: strided DMA on the MTE engine only supports static
+    // power-of-two strides. Static non-power-of-two or dynamic/unknown strides
+    // use the SIMT stride route.
+    if (!shouldUseSimtStride(strides))
         return failure();
-    int64_t lastStride = std::abs(lastStrideC.getSExtValue());
-    if (lastStride <= 1) return failure();
-    if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
-    if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
+    auto lastStrideOpt = getStaticConstInt(strides.back());
 
     // ---- Compute per-axis effective base offsets: mtpt.offsets[d] + (advance.offsets[d] if present)
     ValueRange mtptOffsets = mtpt.getOffsets();
@@ -909,7 +947,12 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
                 llvm::dbgs() << "StridedLoadStoreRewrite [BlockPtr"
                              << (advance ? "+Advance" : "")
                              << "]: tt.load -> ttasc.stride_load\n";
-                llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+                llvm::dbgs() << "  last_stride = ";
+                if (lastStrideOpt.has_value())
+                    llvm::dbgs() << std::abs(lastStrideOpt.value());
+                else
+                    llvm::dbgs() << "dynamic";
+                llvm::dbgs() << "\n";
                 llvm::dbgs() << strideLoadResult.getDefiningOp() << "\n";
                 llvm::dbgs()
                     << "----------------------------------------------\n";
@@ -983,7 +1026,12 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
                      << (advance ? "+Advance" : "")
                      << (boundaryCheck.empty() ? "" : "+Boundary")
                      << "]: tt.load -> tt.indirect_load\n";
-        llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+        llvm::dbgs() << "  last_stride = ";
+        if (lastStrideOpt.has_value())
+            llvm::dbgs() << std::abs(lastStrideOpt.value());
+        else
+            llvm::dbgs() << "dynamic";
+        llvm::dbgs() << "\n";
         llvm::dbgs() << indirectLoad << "\n";
         llvm::dbgs() << "----------------------------------------------\n";
     });
@@ -1005,7 +1053,7 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
     Value scalarBase = getScalarBasePtr(addPtrOp.getPtr());
     if (!scalarBase) return failure();
 
-    if (!offsetMayContainStrideGtOne(addPtrOp.getOffset())) return failure();
+    if (!offsetMayContainNonUnitStride(addPtrOp.getOffset())) return failure();
 
     TritonToStructured::PtrAnalysis ptrAnalysis;
     TritonToStructured::PtrState ptrState;
@@ -1020,21 +1068,18 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
     ptrState.analyzePermute();
     if (ptrState.isPermuted) return markInspectedAndReturn();
 
-    // Use SIMT indirect only for static non-pow2 or masked single-tile pow2
-    // strides; keep dynamic strides on the structured SIMD path.
+    SmallVector<OpFoldResult> analyzedStrides;
+    analyzedStrides.reserve(ptrState.stateInfo.size());
+    for (const auto &stateInfo : ptrState.stateInfo)
+        analyzedStrides.push_back(stateInfo.stride);
     auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
-    if (!lastStrideOpt.has_value()) return markInspectedAndReturn();
-    int64_t lastStride = std::abs(lastStrideOpt.value());
-    if (lastStride <= 1) return markInspectedAndReturn();
+    bool useStrideStore = shouldUseSimtStride(analyzedStrides);
     bool routeMaskedPow2ToIndirect =
+        !useStrideStore && lastStrideOpt.has_value() &&
+        isStaticNonUnitPowerOfTwo(lastStrideOpt.value()) &&
         shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), valueType);
-    if (lastStride == 2 && !routeMaskedPow2ToIndirect)
-        return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
-    if ((lastStride & (lastStride - 1)) == 0 &&
-        !routeMaskedPow2ToIndirect)
-        return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
-
-    bool useStrideStore = !routeMaskedPow2ToIndirect;
+    if (!useStrideStore && !routeMaskedPow2ToIndirect)
+        return markInspectedAndReturn();
     if (useStrideStore && valueType.getRank() >= 1 &&
         valueType.getRank() <= 3 &&
         valueType.hasStaticShape() &&
@@ -1078,7 +1123,12 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
                     << "----------------------------------------------\n";
                 llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr/Store]: "
                                 "tt.store -> ttasc.stride_store\n";
-                llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+                llvm::dbgs() << "  last_stride = ";
+                if (lastStrideOpt.has_value())
+                    llvm::dbgs() << std::abs(lastStrideOpt.value());
+                else
+                    llvm::dbgs() << "dynamic";
+                llvm::dbgs() << "\n";
                 llvm::dbgs() << *strideStore << "\n";
                 llvm::dbgs()
                     << "----------------------------------------------\n";
@@ -1112,7 +1162,12 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
         llvm::dbgs() << "----------------------------------------------\n";
         llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr/Store]: tt.store -> "
                         "tt.indirect_store\n";
-        llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+        llvm::dbgs() << "  last_stride = ";
+        if (lastStrideOpt.has_value())
+            llvm::dbgs() << std::abs(lastStrideOpt.value());
+        else
+            llvm::dbgs() << "dynamic";
+        llvm::dbgs() << "\n";
         llvm::dbgs() << indirectStore << "\n";
         llvm::dbgs() << "----------------------------------------------\n";
     });
@@ -1140,16 +1195,11 @@ static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
     auto strides = mtpt.getStrides();
     if (strides.empty() || static_cast<int64_t>(strides.size()) != rank)
         return failure();
-    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): dynamic strides stay on
-    // the structured SIMD path; only static non-power-of-two strides fall
-    // through to SIMT stride_store.
-    APInt lastStrideC;
-    if (!matchPattern(strides.back(), m_ConstantInt(&lastStrideC)))
+    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): static
+    // non-power-of-two or dynamic/unknown strides go to SIMT stride_store.
+    if (!shouldUseSimtStride(strides))
         return failure();
-    int64_t lastStride = std::abs(lastStrideC.getSExtValue());
-    if (lastStride <= 1) return failure();
-    if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
-    if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
+    auto lastStrideOpt = getStaticConstInt(strides.back());
 
     ValueRange mtptOffsets = mtpt.getOffsets();
     ValueRange advOffsets = advance ? advance.getOffsets() : ValueRange{};
@@ -1214,7 +1264,12 @@ static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
                                  << (advance ? "+Advance" : "")
                                  << (boundaryCheck.empty() ? "" : "+Boundary")
                                  << "/Store]: tt.store -> ttasc.stride_store\n";
-                    llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+                    llvm::dbgs() << "  last_stride = ";
+                    if (lastStrideOpt.has_value())
+                        llvm::dbgs() << std::abs(lastStrideOpt.value());
+                    else
+                        llvm::dbgs() << "dynamic";
+                    llvm::dbgs() << "\n";
                     llvm::dbgs() << *strideStore << "\n";
                     llvm::dbgs()
                         << "----------------------------------------------\n";
@@ -1277,7 +1332,12 @@ static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
                      << (advance ? "+Advance" : "")
                      << (boundaryCheck.empty() ? "" : "+Boundary")
                      << "/Store]: tt.store -> tt.indirect_store\n";
-        llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+        llvm::dbgs() << "  last_stride = ";
+        if (lastStrideOpt.has_value())
+            llvm::dbgs() << std::abs(lastStrideOpt.value());
+        else
+            llvm::dbgs() << "dynamic";
+        llvm::dbgs() << "\n";
         llvm::dbgs() << indirectStore << "\n";
         llvm::dbgs() << "----------------------------------------------\n";
     });

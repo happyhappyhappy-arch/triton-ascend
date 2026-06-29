@@ -80,11 +80,12 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 }
 
 // -----
-// V1 rank-1 miss (AddPtr, dynamic stride):
-// Runtime stride may be 1 or power-of-two, so keep the structured SIMD path.
+// V1 rank-1 hit (AddPtr, dynamic stride):
+// Dynamic stride cannot be proven static power-of-two, so route to stride_load.
 // CHECK-LABEL: func.func @addptr_dynamic_stride_1d
 // CHECK-NOT: call @triton_indirect_load
-// CHECK-NOT: call @triton_stride_load
+// CHECK: call @triton_stride_load
+// CHECK-SAME: : (memref<?xf32>, i64, f32, i64, i64) -> tensor<256xf32>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @addptr_dynamic_stride_1d(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
                                            %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
@@ -103,11 +104,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 }
 
 // -----
-// V2 rank-1 miss (AddPtr store, scalar base AddPtr + dynamic stride):
-// Runtime stride may be 1 or power-of-two, so keep the structured SIMD path.
+// V2 rank-1 hit (AddPtr store, scalar base AddPtr + dynamic stride):
+// Dynamic stride cannot be proven static power-of-two, so route to stride_store.
 // CHECK-LABEL: func.func @addptr_dynamic_stride_store_scalar_base
 // CHECK-NOT: call @triton_indirect_store
-// CHECK-NOT: call @triton_stride_store
+// CHECK: call @triton_stride_store(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<32xf32>, i64, i64, i64) -> ()
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @addptr_dynamic_stride_store_scalar_base(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
                                                           %base_offset: i64,
@@ -344,11 +345,12 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 }
 
 // -----
-// V1 rank-1 miss (make_tensor_ptr, dynamic stride):
-// Runtime stride may be 1 or power-of-two, so keep the structured SIMD path.
+// V1 rank-1 hit (make_tensor_ptr, dynamic stride):
+// Dynamic stride cannot be proven static power-of-two, so route to stride_load.
 // CHECK-LABEL: func.func @mtpt_1d_dynamic_stride
 // CHECK-NOT: call @triton_indirect_load
-// CHECK-NOT: call @triton_stride_load
+// CHECK: call @triton_stride_load
+// CHECK-SAME: : (memref<?xf32>, i64, f32, i64, i64) -> tensor<128xf32>
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @mtpt_1d_dynamic_stride(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
                                          %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
@@ -495,10 +497,11 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 }
 
 // -----
-// V2 miss (make_tensor_ptr Store, dynamic stride):
-// Runtime stride may be 1 or power-of-two, so keep the structured SIMD path.
+// V2 hit (make_tensor_ptr Store, dynamic stride):
+// Dynamic stride cannot be proven static power-of-two, so route to stride_store.
 // CHECK-LABEL: func.func @mtpt_store_dynamic_stride
 // CHECK-NOT: call @triton_indirect_store
+// CHECK: call @triton_stride_store(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<128xf32>, i64, i64, i64) -> ()
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @mtpt_store_dynamic_stride(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
                                             %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
