@@ -246,6 +246,21 @@ static Value addScalarOffsetToTensor(Value offsetTensor, Value scalarOffset,
                                           scalarOffsetTensor);
 }
 
+static bool dependsOnScalarLoad(Value value, int depthBudget = 24) {
+    if (depthBudget <= 0)
+        return false;
+    Operation *defOp = value.getDefiningOp();
+    if (!defOp)
+        return false;
+    if (auto loadOp = dyn_cast<triton::LoadOp>(defOp))
+        return !isa<RankedTensorType>(loadOp.getResult().getType());
+    for (Value operand : defOp->getOperands()) {
+        if (dependsOnScalarLoad(operand, depthBudget - 1))
+            return true;
+    }
+    return false;
+}
+
 static Value getStrideLoadOtherScalar(triton::LoadOp op,
                                       RankedTensorType resultType,
                                       PatternRewriter &rewriter) {
@@ -642,6 +657,48 @@ static Value buildPaddingOther(Location loc, PatternRewriter &rewriter,
             loc, rewriter.getZeroAttr(elementType));
     }
     return rewriter.create<triton::SplatOp>(loc, resultType, padScalar);
+}
+
+static LogicalResult tryRewriteScalarIndexedAddPtrLoad(
+    triton::LoadOp op, triton::AddPtrOp addPtrOp,
+    RankedTensorType resultType, PatternRewriter &rewriter) {
+    if (resultType.getRank() != 1)
+        return failure();
+
+    Value scalarBase = getScalarBasePtr(addPtrOp.getPtr());
+    if (!scalarBase)
+        return failure();
+    if (!dependsOnScalarLoad(addPtrOp.getOffset()))
+        return failure();
+
+    auto loc = op.getLoc();
+    Value offsetTensor =
+        ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
+    if (!offsetTensor)
+        return failure();
+
+    Value src;
+    Value scalarOffset;
+    if (failed(unwrapScalarAddPtrChain(scalarBase, src, scalarOffset, loc,
+                                       rewriter)))
+        return failure();
+    offsetTensor =
+        addScalarOffsetToTensor(offsetTensor, scalarOffset, loc, rewriter);
+
+    Value other = op.getOther();
+    if (!other && op.getMask()) {
+        other = buildPaddingOther(loc, rewriter, resultType, op.getPadding());
+        if (!other)
+            return failure();
+    }
+
+    auto indirectLoadOp = rewriter.create<triton::ascend::IndirectLoadOp>(
+        loc, resultType, src, offsetTensor, op.getMask(), other,
+        ConverterUtils::requiresVolatileIndirectLoad(op.getPtr(), op));
+    indirectLoadOp->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
+                            UnitAttr::get(rewriter.getContext()));
+    rewriter.replaceOp(op, indirectLoadOp.getResult());
+    return success();
 }
 
 // AddPtr path: tt.load(tt.addptr(tt.splat(%scalar_ptr), %offsets)).
@@ -1310,6 +1367,9 @@ LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
     Value ptr = op.getPtr();
     if (auto addPtrOp = ptr.getDefiningOp<triton::AddPtrOp>()) {
         if (!op.getBoundaryCheck().empty()) return failure();  // defensive
+        if (succeeded(tryRewriteScalarIndexedAddPtrLoad(op, addPtrOp,
+                                                        resultType, rewriter)))
+            return success();
         return tryRewriteAddPtrLoad(op, addPtrOp, resultType, rewriter);
     }
     if (auto mtptOp = ptr.getDefiningOp<triton::MakeTensorPtrOp>()) {

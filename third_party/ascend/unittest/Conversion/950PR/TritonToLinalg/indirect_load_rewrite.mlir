@@ -80,6 +80,38 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 }
 
 // -----
+// Sparse row-gather hit: the row base depends on a scalar index load, so the
+// contiguous row copy should be routed to SIMT indirect_load with the complete
+// per-element offset tensor.
+// CHECK-LABEL: func.func @addptr_scalar_indexed_row_load
+// CHECK: call @triton_indirect_load(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) {isVolatile = false} : (memref<?xbf16>, tensor<64xi64>, tensor<64xi1>, tensor<64xbf16>) -> tensor<64xbf16>
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
+  tt.func public @addptr_scalar_indexed_row_load(%arg0: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
+                                                 %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+                                                 %arg2: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
+                                                 %row_stride: i32) {
+    %c0_i32 = arith.constant 0 : i32
+    %zero_i = arith.constant dense<0> : tensor<64xi32>
+    %zero = arith.constant dense<0.000000e+00> : tensor<64xbf16>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %idx_ptr = tt.addptr %arg1, %c0_i32 : !tt.ptr<i32>, i32
+    %idx = tt.load %idx_ptr : !tt.ptr<i32>
+    %idx_splat = tt.splat %idx : i32 -> tensor<64xi32>
+    %stride_splat = tt.splat %row_stride : i32 -> tensor<64xi32>
+    %row_base = arith.muli %idx_splat, %stride_splat : tensor<64xi32>
+    %offsets = arith.addi %row_base, %range : tensor<64xi32>
+    %mask = arith.cmpi sge, %range, %zero_i : tensor<64xi32>
+    %src_base = tt.splat %arg0 : !tt.ptr<bf16> -> tensor<64x!tt.ptr<bf16>>
+    %src_ptr = tt.addptr %src_base, %offsets : tensor<64x!tt.ptr<bf16>>, tensor<64xi32>
+    %value = tt.load %src_ptr, %mask, %zero : tensor<64x!tt.ptr<bf16>>
+    %dst_base = tt.splat %arg2 : !tt.ptr<bf16> -> tensor<64x!tt.ptr<bf16>>
+    %dst_ptr = tt.addptr %dst_base, %range : tensor<64x!tt.ptr<bf16>>, tensor<64xi32>
+    tt.store %dst_ptr, %value, %mask : tensor<64x!tt.ptr<bf16>>
+    tt.return
+  }
+}
+
+// -----
 // V1 rank-1 miss (AddPtr, dynamic stride):
 // Runtime stride may be 1 or power-of-two, so keep the structured SIMD path.
 // CHECK-LABEL: func.func @addptr_dynamic_stride_1d
