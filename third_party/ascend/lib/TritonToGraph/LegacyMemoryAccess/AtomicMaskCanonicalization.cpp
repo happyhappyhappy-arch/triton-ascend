@@ -170,25 +170,51 @@ static FailureOr<TypedAttr> matchAtomicMask(triton::AtomicRMWOp op) {
   return failure();
 }
 
+static bool hasAtomicMaskCandidate(triton::FuncOp function) {
+  return function
+      .walk([](triton::AtomicRMWOp op) {
+        return succeeded(matchAtomicMask(op)) ? WalkResult::interrupt()
+                                              : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 class AtomicMaskPlan final : public RewritePlan {
 public:
-  AtomicMaskPlan(triton::AtomicRMWOp op, unsigned epoch)
-      : op(op), epoch(epoch) {}
+  AtomicMaskPlan(triton::FuncOp function, unsigned epoch)
+      : function(function), epoch(epoch) {}
 
   GraphOptimizationRuleId getRuleId() const override {
     return GraphOptimizationRuleId::AtomicMaskCanonicalization;
   }
   unsigned getBenefit() const override { return 1; }
-  Operation *getAnchor() const override { return op; }
+  Operation *getAnchor() const override { return function; }
   unsigned getCreationEpoch() const override { return epoch; }
 
   LogicalResult revalidate(GraphOptimizationContext &context) const override {
-    return success(op->getParentOfType<triton::FuncOp>() ==
-                       context.getFunction() &&
-                   succeeded(matchAtomicMask(op)));
+    return success(function == context.getFunction() &&
+                   hasAtomicMaskCandidate(function));
   }
 
   LogicalResult apply(IRRewriter &rewriter) override {
+    bool applied = false;
+    bool changed;
+    do {
+      SmallVector<triton::AtomicRMWOp> atomics;
+      function.walk([&](triton::AtomicRMWOp op) { atomics.push_back(op); });
+      changed = false;
+      for (triton::AtomicRMWOp op : atomics)
+        changed |= succeeded(rewriteAtomicMask(op, rewriter));
+      applied |= changed;
+      // Each rewrite erases an atomic or removes a select from its value chain.
+      // Repeat for newly exposed identities, within the same function plan.
+    } while (changed);
+    return success(applied);
+  }
+
+private:
+  static LogicalResult rewriteAtomicMask(triton::AtomicRMWOp op,
+                                         IRRewriter &rewriter) {
     auto identity = matchAtomicMask(op);
     if (failed(identity))
       return failure();
@@ -211,8 +237,7 @@ public:
     }
 
     // Retire only unused select/shape/constant producers of this atomic.
-    // Shared values and unrelated IR stay intact; other atomics require their
-    // own plan and consume their own rewrite budget.
+    // Shared values and unrelated IR stay intact.
     llvm::SmallSetVector<Operation *, 16> dead;
     if (Operation *def = src.getDefiningOp())
       dead.insert(def);
@@ -229,8 +254,7 @@ public:
     return success();
   }
 
-private:
-  triton::AtomicRMWOp op;
+  triton::FuncOp function;
   unsigned epoch;
 };
 
@@ -245,11 +269,10 @@ public:
   LogicalResult findCandidates(
       GraphOptimizationContext &context,
       SmallVectorImpl<std::unique_ptr<RewritePlan>> &plans) override {
-    context.getFunction().walk([&](triton::AtomicRMWOp op) {
-      if (succeeded(matchAtomicMask(op)))
-        plans.push_back(
-            std::make_unique<AtomicMaskPlan>(op, context.getEpoch()));
-    });
+    triton::FuncOp function = context.getFunction();
+    if (hasAtomicMaskCandidate(function))
+      plans.push_back(
+          std::make_unique<AtomicMaskPlan>(function, context.getEpoch()));
     return success();
   }
 };

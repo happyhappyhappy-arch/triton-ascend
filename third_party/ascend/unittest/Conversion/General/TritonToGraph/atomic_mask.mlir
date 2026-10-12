@@ -1,5 +1,5 @@
 // RUN: triton-opt --graph-optimize --split-input-file %s | FileCheck %s --check-prefix=DISABLED
-// RUN: triton-opt --graph-optimize='rule-mask=65536' --split-input-file %s | FileCheck %s
+// RUN: triton-opt --graph-optimize='rule-mask=65536 max-rewrites-per-function=1' --split-input-file %s | FileCheck %s
 
 // Recover nested value predicates without classifying or lowering the mask.
 // Pure SIMT can use this result directly for native predicated lowering.
@@ -444,5 +444,21 @@ tt.func @preserve_synchronizing_select(%ptr: !tt.ptr<i32>, %value: i32, %active:
   %old2 = tt.atomic_rmw add, acq_rel, gpu, %ptr, %selected : (!tt.ptr<i32>, i32) -> i32
   %old3 = tt.atomic_rmw add, relaxed, sys, %ptr, %selected : (!tt.ptr<i32>, i32) -> i32
   %old4 = tt.atomic_rmw add, relaxed, cta, %ptr, %selected : (!tt.ptr<i32>, i32) -> i32
+  tt.return
+}
+
+// -----
+
+// One function plan handles shared inputs and identities exposed by recovery.
+// Both atomics must disappear even with a single rewrite budget.
+// CHECK-LABEL: tt.func @shared_identity_select
+// CHECK-NOT: arith.select
+// CHECK-NOT: tt.atomic_rmw
+// CHECK: tt.return
+tt.func @shared_identity_select(%ptr: !tt.ptr<i32>, %active: i1) {
+  %zero = arith.constant 0 : i32
+  %selected = arith.select %active, %zero, %zero : i32
+  %a = tt.atomic_rmw add, relaxed, gpu, %ptr, %selected : (!tt.ptr<i32>, i32) -> i32
+  %b = tt.atomic_rmw add, relaxed, gpu, %ptr, %selected : (!tt.ptr<i32>, i32) -> i32
   tt.return
 }
